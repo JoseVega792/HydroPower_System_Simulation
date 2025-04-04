@@ -21,7 +21,7 @@ class LSTMCell:
         self.hidden_dim = hidden_dim
         self.learning_rate = learning_rate
         
-        # Initialize weights and biases for forget, input, candidate, and output gates
+        # Initialize weights and biases for forget, input, candidate, and output gates as tf.Variable
         self.W_f = np.random.randn(hidden_dim, hidden_dim + input_dim) * 0.01
         self.b_f = np.zeros((hidden_dim, 1))
         
@@ -34,7 +34,13 @@ class LSTMCell:
         self.W_o = np.random.randn(hidden_dim, hidden_dim + input_dim) * 0.01
         self.b_o = np.zeros((hidden_dim, 1))
 
-        self.optimizer = self.get_optimizer(optimizer_type)
+        # Custom optimizer: SGD or Adam
+        if optimizer_type == 'sgd':
+            self.optimizer = self.sgd
+        elif optimizer_type == 'adam':
+            self.optimizer = self.adam
+        else:
+            raise ValueError(f"Unknown optimizer: {optimizer_type}")
 
     def get_optimizer(self, optimizer_type):
         optimizers = {
@@ -65,13 +71,18 @@ class LSTMCell:
         assert h_prev.shape[0] == self.hidden_dim, f"Expected h_prev shape ({self.hidden_dim}, batch_size), but got {h_prev.shape}"
         assert x_t.shape[0] == self.input_dim, f"Expected x_t shape ({self.input_dim}, batch_size), but got {x_t.shape}"
 
+        # Ensure dimensions match before concatenation
+        if h_prev.shape[1] != x_t.shape[1]:
+            raise ValueError(f"Dimension mismatch: h_prev has {h_prev.shape[1]} columns, but x_t has {x_t.shape[1]} columns")
+
         concat = np.concatenate((h_prev, x_t), axis=0)  # Concatenate previous hidden state and input
         
         f_t = self.sigmoid(np.dot(self.W_f, concat) + self.b_f)  # Forget gate
         i_t = self.sigmoid(np.dot(self.W_i, concat) + self.b_i)  # Input gate
         C_tilde = np.tanh(np.dot(self.W_c, concat) + self.b_c)  # Candidate memory
-        C_t = f_t * C_prev + i_t * C_tilde  # New cell state
         o_t = self.sigmoid(np.dot(self.W_o, concat) + self.b_o)  # Output gate
+
+        C_t = f_t * C_prev + i_t * C_tilde  # New cell state
         h_t = o_t * np.tanh(C_t)  # New hidden state
         
         return h_t, C_t, f_t, i_t, C_tilde, o_t, concat
@@ -87,9 +98,6 @@ class LSTMCell:
         di_t = dC_t * C_tilde * i_t * (1 - i_t)
         df_t = dC_t * C_prev * f_t * (1 - f_t)
 
-        # Gradients with respect to the concatenated input
-        dconcat = np.concatenate((df_t, di_t, dC_tilde, do_t), axis=0)
-        
         # Gradients w.r.t. the weights and biases
         dW_f = np.dot(df_t, concat.T)
         dW_i = np.dot(di_t, concat.T)
@@ -108,23 +116,49 @@ class LSTMCell:
         
         return dh_next, dx_t, dC_next, dW_f, dW_i, dW_c, dW_o, db_f, db_i, db_c, db_o
 
+
     def update_weights(self, dW_f, dW_i, dW_c, dW_o, db_f, db_i, db_c, db_o):
         """Update weights using the specified optimizer."""
-        # Convert gradients to TensorFlow variables
-        gradients = [tf.Variable(grad) for grad in [dW_f, dW_i, dW_c, dW_o, db_f, db_i, db_c, db_o]]
+        # Ensure all gradients are converted to TensorFlow variables
+        self.W_f, self.b_f = self.optimizer(self.W_f, self.b_f, dW_f, db_f)
+        self.W_i, self.b_i = self.optimizer(self.W_i, self.b_i, dW_i, db_i)
+        self.W_c, self.b_c = self.optimizer(self.W_c, self.b_c, dW_c, db_c)
+        self.W_o, self.b_o = self.optimizer(self.W_o, self.b_o, dW_o, db_o)
+    
+    def sgd(self, W, b, dW, db):
+        """Simple SGD update rule."""
+        W -= self.learning_rate * dW
+        b -= self.learning_rate * db
+        return W, b
+    
+    def adam(self, W, b, dW, db, beta1=0.9, beta2=0.999, epsilon=1e-8):
+        """Adam optimizer update rule."""
+        if not hasattr(self, 'm_W'):
+            self.m_W = np.zeros_like(W)
+            self.v_W = np.zeros_like(W)
+            self.m_b = np.zeros_like(b)
+            self.v_b = np.zeros_like(b)
         
-        # Convert model variables to TensorFlow variables if they are NumPy arrays
-        variables = [self.W_f, self.W_i, self.W_c, self.W_o, self.b_f, self.b_i, self.b_c, self.b_o]
-        variables = [tf.Variable(var) if not isinstance(var, tf.Variable) else var for var in variables]
-
-        # Recreate the optimizer with the new set of variables
-        self.optimizer = tf.keras.optimizers.Adam()  # Replace with the optimizer you're using
+        # Update moment estimates
+        self.m_W = beta1 * self.m_W + (1 - beta1) * dW
+        self.v_W = beta2 * self.v_W + (1 - beta2) * (dW ** 2)
+        self.m_b = beta1 * self.m_b + (1 - beta1) * db
+        self.v_b = beta2 * self.v_b + (1 - beta2) * (db ** 2)
         
-        # Apply gradients
-        self.optimizer.apply_gradients(zip(gradients, variables))
+        # Bias correction
+        m_W_hat = self.m_W / (1 - beta1)
+        v_W_hat = self.v_W / (1 - beta2)
+        m_b_hat = self.m_b / (1 - beta1)
+        v_b_hat = self.v_b / (1 - beta2)
+        
+        # Parameter updates
+        W -= self.learning_rate * m_W_hat / (np.sqrt(v_W_hat) + epsilon)
+        b -= self.learning_rate * m_b_hat / (np.sqrt(v_b_hat) + epsilon)
+        
+        return W, b
 
 class LSTMLayer:
-    def __init__(self, input_dim, output_dim, hidden_dim, seq_len, learning_rate=0.01, optimizer_type='adam'):
+    def __init__(self, input_dim, output_dim, hidden_dim, seq_len, learning_rate=0.001, optimizer_type='adam'):
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.seq_len = seq_len
@@ -146,7 +180,7 @@ class LSTMLayer:
 
         h_states, caches = [], []
         for t in range(self.seq_len):
-            x_t = X[t].T  # Shape should be (input_dim, batch_size)
+            x_t = X[t].reshape(self.input_dim, -1)  # Shape should be (input_dim, batch_size)
             print(f"X[t] shape at time step {t}: {X[t].shape}")
             # For the first time step, C_prev is initialized to zeros
             if t > 0:
@@ -160,8 +194,11 @@ class LSTMLayer:
         h_states = np.stack(h_states)  # Shape: (seq_len, hidden_dim, batch_size)
 
         # **Apply the output projection**
-        y_pred = np.dot(h_states.transpose(0, 2, 1), self.W_out) + self.b_out  
-        # (seq_len, batch_size, output_dim)
+        h_states_reshaped = h_states.reshape(-1, self.hidden_dim)  # Shape: (batch_size * seq_len, hidden_dim)
+        y_pred = np.dot(h_states_reshaped, self.W_out) + self.b_out  # Shape: (batch_size * seq_len, output_dim)
+        y_pred = y_pred.reshape(self.seq_len, batch_size, -1)
+        # Reshape y_pred back to (seq_len, batch_size, output_dim)
+        y_pred = y_pred.reshape(batch_size, -1)
 
         return y_pred, caches
 
@@ -224,20 +261,23 @@ class LSTMLayer:
                 
             print(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss/num_batches}")
 
-    def inference(self, X):
+    def predict(self, X):
         """Inference method to predict values without updating weights."""
-        batch_size = X.shape[1]
-        h_t = np.zeros((self.hidden_dim, batch_size))
-        C_t = np.zeros((self.hidden_dim, batch_size))
-        
+        batch_size = X.shape[0]  # Ensure correct batch size extraction
+        h_t = np.zeros((self.hidden_dim, batch_size))  # Corrected shape
+        C_t = np.zeros((self.hidden_dim, batch_size))  # Corrected shape
+
         h_states = []
-        for t in range(self.seq_len):
-            x_t = X[t].T
+        for t in range(X.shape[1]):  # Iterate over timesteps
+            x_t = X[:, t, :].T   
             h_t, C_t, _, _, _, _, _ = self.lstm_cell.forward(x_t, h_t, C_t)
             h_states.append(h_t)
-        
-        return h_states[-1]  # Returning last hidden state as prediction
-'''
+
+        h_states = np.stack(h_states, axis=1)  # Shape: (batch_size, seq_len, hidden_dim)
+
+        return h_states[-1]  # Shape: (batch_size, output_dim)
+
+    '''
 # Create dummy data
 sequence_length = 10
 batch_size = 10
@@ -394,38 +434,51 @@ lstm_model.compile(optimizer=optimizer, loss='mean_squared_error')
 # Fit the model on training data
 #lstm_model.fit(X_train, y_train, epochs=100, batch_size=1, validation_data=(X_test, y_test))
 
+#lstm_predictions = lstm_model.predict(X_test)
+#lstm_predictions = lstm_predictions.reshape(-1, 1)
+#lstm_predictions = scaler_values.inverse_transform(lstm_predictions)
+
 # After training, perform inference with the custom LSTM class
 # Create the custom LSTM layer (assuming LSTMLayer is your custom class)
-input_dim = 1  # Assuming input dimension is 1, adjust as needed
-hidden_dim = 50  # Adjust based on your model
-seq_len = seq_length  # Sequence length, already defined in your setup
-output_dim = seq_length # Output dimension, adjust as needed
-learning_rate = 0.01
-optimizer_type = 'adam'
+input_dim = 2   # Adjust based on the number of features in X
+hidden_dim = 50  # Hidden state dimension
+seq_len = seq_length  # Sequence length
+output_dim = 1  # Adjust based on y shape
+learning_rate = 0.001
+optimizer_type = 'sgd'
 
-# Reshape for custom LSTM (adjust if your input_dim, hidden_dim, and batch_size differ)
-#X_train_custom = X_train.reshape((X_train.shape[0], seq_len, input_dim))  # Reshape if needed
-#X_test_custom = X_test.reshape((X_test.shape[0], seq_len, input_dim))  # Reshape if needed
+# Ensure proper input shape (num_samples, seq_len, input_dim)
+X_train = X_train.reshape((X_train.shape[0], seq_len, input_dim))
+X_test = X_test.reshape((X_test.shape[0], seq_len, input_dim))
+
+# Ensure y_train has the correct shape (num_samples, output_dim)
+y_train = y_train.reshape((-1, output_dim))
 
 # Create an instance of the custom LSTM layer
 lstm_layer = LSTMLayer(input_dim, output_dim, hidden_dim, seq_len, learning_rate, optimizer_type)
 
-# Train the custom LSTM model
-epochs = 10
-#print(f"X_train shape: {X_train_custom.shape}")
+# Train the model
+epochs = 100
 lstm_layer.train(X_train, y_train, epochs=epochs, batch_size=1)
 
-# Use the model for inference on X_test
-# X_test is reshaped for the custom LSTM layer if necessary
-predictions = lstm_layer.inference(X_test)
+# Use the trained model for inference
+predictions = lstm_layer.predict(X_test)
+print(predictions.shape)
+
+# Ensure predictions have the correct shape before inverse transformation
+predictions = predictions.reshape(-1, 1)  # Taking the last time step
+
+# Convert back to original scale if using MinMaxScaler
+predictions = scaler_values.inverse_transform(predictions)
 
 # Print predictions
+print(predictions.shape)
 print(predictions)
 # Plot the predictions
 y_test = scaler_values.inverse_transform(y_test.reshape(-1,1))
 test_timestamps = df.index[train_size + seq_length:]
+print(y_test.shape)
 plt.figure(figsize=(14, 7))
-print(y_test)
 plt.plot(test_timestamps, y_test, label='Actual', color='black')
 plt.plot(test_timestamps, predictions, label='SLSTM Predicted', color='blue')
 #plt.plot(test_timestamps, lstm_predictions, label='LSTM Predicted', color='blue')
