@@ -117,23 +117,7 @@ class NumPyLSTMFullBP:
             return x * mask / (1 - self.dropout_rate)  # Scale by (1 - dropout_rate) to maintain expected value
         return x
 
-    def adaptive_thresholding(c_t, c_prev, deviation_threshold=2.0):
-        mean_c_t = np.mean(c_t)
-        std_c_t = np.std(c_t)
-
-        # Compute gradient magnitude
-        grad_c_t = np.abs(c_t - c_prev)  
-
-        # Adaptive threshold: scales dynamically based on change in c_t
-        adaptive_threshold = deviation_threshold * std_c_t * (1 + np.tanh(grad_c_t / (std_c_t + 1e-6)))
-
-        # Generate random values within [-adaptive_threshold, adaptive_threshold]
-        random_values = np.random.uniform(-adaptive_threshold, adaptive_threshold, size=c_t.shape)
-
-        # Apply thresholding: replace extreme values with random values within the range
-        c_t = np.where(np.abs(c_t - mean_c_t) >= adaptive_threshold, mean_c_t + random_values, c_t)
-
-    def forward(self, x, cache_enabled=False, deviation_threshold=2.0):
+    def forward(self, x, cache_enabled=False):
         T, _ = x.shape
         h_t = np.zeros((self.hidden_dim, 1))
         c_t = np.zeros((self.hidden_dim, 1))
@@ -148,25 +132,7 @@ class NumPyLSTMFullBP:
             o_t = self.sigmoid(np.dot(self.W['o'], combined) + self.b['o'])
             c_candidate = self.tanh(np.dot(self.W['c'], combined) + self.b['c'])
             c_prev = c_t.copy()
-
             c_t = f_t * c_t + i_t * c_candidate
-            # Apply adaptive thresholding to c_t
-            #c_t = self.adaptive_thresholding(c_t, c_prev)
-            mean_c_t = np.mean(c_t)
-            std_c_t = np.std(c_t)
-
-            # Compute gradient magnitude
-            grad_c_t = np.abs(c_t - c_prev)  
-
-            # Adaptive threshold: scales dynamically based on change in c_t
-            adaptive_threshold = deviation_threshold * std_c_t * (1 + np.tanh(grad_c_t / (std_c_t + 1e-6)))
-
-            # Generate random values within [-adaptive_threshold, adaptive_threshold]
-            random_values = np.random.uniform(-adaptive_threshold, adaptive_threshold, size=c_t.shape)
-
-            # Apply thresholding: replace extreme values with random values within the range
-            c_t = np.where(np.abs(c_t - mean_c_t) >= adaptive_threshold, random_values, c_t)
-
             h_t = o_t * self.tanh(c_t)
 
             # Apply dropout on h_t (hidden state) or gates (f, i, o, c_candidate)
