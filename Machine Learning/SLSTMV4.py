@@ -116,68 +116,75 @@ class NumPyLSTMFullBP:
             mask = np.random.binomial(1, 1 - self.dropout_rate, size=x.shape)
             return x * mask / (1 - self.dropout_rate)  # Scale by (1 - dropout_rate) to maintain expected value
         return x
+    
 
-    def adaptive_thresholding(c_t, c_prev, deviation_threshold=2.0):
-        mean_c_t = np.mean(c_t)
-        std_c_t = np.std(c_t)
+    def adaptive_thresholding(self, c_t, c_prev, deviation_threshold, optimizer: AdamOptimizer, key: str, alpha=0.95, temperature=1.0):
+        """
+        Optimized adaptive thresholding with dynamic alpha adjustment based on gradient size.
+        """
+        # Calculate the gradient (change in cell state)
+        grad_c_t = np.abs(c_t - c_prev)
 
-        # Compute gradient magnitude
-        grad_c_t = np.abs(c_t - c_prev)  
+        # Compute smoothed state using the optimizer
+        smoothed_state = optimizer.update(c_prev, grad_c_t, key)
 
-        # Adaptive threshold: scales dynamically based on change in c_t
-        adaptive_threshold = deviation_threshold * std_c_t * (1 + np.tanh(grad_c_t / (std_c_t + 1e-6)))
+        # Precompute standard deviation and deviation
+        std_c_t = np.std(c_t) + 1e-6  # Avoid division by zero
+        deviation = np.abs(c_t - smoothed_state)
 
-        # Generate random values within [-adaptive_threshold, adaptive_threshold]
-        random_values = np.random.uniform(-adaptive_threshold, adaptive_threshold, size=c_t.shape)
+        # Compute adaptive thresholds
+        grad_clip = np.clip(grad_c_t / std_c_t, -10, 10)
+        adaptive_threshold = deviation_threshold * std_c_t * (1 + np.tanh(grad_clip))
+        scaled_threshold = adaptive_threshold * temperature
 
-        # Apply thresholding: replace extreme values with random values within the range
-        c_t = np.where(np.abs(c_t - mean_c_t) >= adaptive_threshold, mean_c_t + random_values, c_t)
+        # Vectorized replacement logic
+        replace_mask = deviation >= scaled_threshold
+        replacement = np.random.uniform(-scaled_threshold[replace_mask], scaled_threshold[replace_mask])
 
-    def forward(self, x, cache_enabled=False, deviation_threshold=2.0):
+        # Dynamically adjust alpha based on gradient size
+        adjusted_alpha = alpha * (1 - np.tanh(np.mean(grad_c_t) / std_c_t))  # Use tanh for smoother scaling
+
+        # Update c_t based on adaptive thresholding
+        c_t[replace_mask] = adjusted_alpha * c_t[replace_mask] + (1 - adjusted_alpha) * replacement
+
+        return c_t
+
+
+    def forward(self, x, cache_enabled=True, deviation_threshold=2.0, temperature=1.0):
         T, _ = x.shape
-        h_t = np.zeros((self.hidden_dim, 1))
-        c_t = np.zeros((self.hidden_dim, 1))
+        h_t = np.zeros((self.hidden_dim, 1))  # Initialize hidden state
+        c_t = np.zeros((self.hidden_dim, 1))  # Initialize cell state
         cache = []  # to store values for backpropagation if needed
 
         for t in range(T):
-            x_t = x[t].reshape(-1, 1)
-            combined = np.vstack((h_t, np.ones((1, 1)), x_t))
-            # Compute gate activations.
+            x_t = x[t].reshape(-1, 1)  # Current input at time t
+            combined = np.vstack((h_t, np.ones((1, 1)), x_t))  # Combine previous hidden state with input
+
+            # Compute gate activations
             f_t = self.sigmoid(np.dot(self.W['f'], combined) + self.b['f'])
             i_t = self.sigmoid(np.dot(self.W['i'], combined) + self.b['i'])
             o_t = self.sigmoid(np.dot(self.W['o'], combined) + self.b['o'])
             c_candidate = self.tanh(np.dot(self.W['c'], combined) + self.b['c'])
             c_prev = c_t.copy()
 
+            # Compute cell state update
             c_t = f_t * c_t + i_t * c_candidate
-            # Apply adaptive thresholding to c_t
-            #c_t = self.adaptive_thresholding(c_t, c_prev)
-            mean_c_t = np.mean(c_t)
-            std_c_t = np.std(c_t)
 
-            # Compute gradient magnitude
-            grad_c_t = np.abs(c_t - c_prev)  
+            # Apply adaptive thresholding to c_t, passing temperature to control thresholding
+            c_t = self.adaptive_thresholding(c_t, c_prev, deviation_threshold, self.optimizer, f"time_{t}", 0.95, temperature)
 
-            # Adaptive threshold: scales dynamically based on change in c_t
-            adaptive_threshold = deviation_threshold * std_c_t * (1 + np.tanh(grad_c_t / (std_c_t + 1e-6)))
-
-            # Generate random values within [-adaptive_threshold, adaptive_threshold]
-            random_values = np.random.uniform(-adaptive_threshold, adaptive_threshold, size=c_t.shape)
-
-            # Apply thresholding: replace extreme values with random values within the range
-            c_t = np.where(np.abs(c_t - mean_c_t) >= adaptive_threshold, random_values, c_t)
-
+            # Compute hidden state output
             h_t = o_t * self.tanh(c_t)
 
             # Apply dropout on h_t (hidden state) or gates (f, i, o, c_candidate)
             h_t = self.dropout(h_t)  # Dropout on hidden state
-            # Optionally apply dropout on gates as well if needed
-            f_t = self.dropout(f_t)
+            f_t = self.dropout(f_t)  # Optionally apply dropout on gates as well
             i_t = self.dropout(i_t)
             o_t = self.dropout(o_t)
             c_candidate = self.dropout(c_candidate)
 
             if cache_enabled:
+                # Store necessary variables in the cache for backpropagation
                 cache.append({
                     'combined': combined,
                     'f': f_t,
@@ -188,12 +195,15 @@ class NumPyLSTMFullBP:
                     'c': c_t.copy(),
                     'h': h_t.copy()
                 })
-        # Final output computation.
+
+        # Final output computation
         y_t = np.dot(self.W['y'], h_t) + self.b['y']
+        
         if cache_enabled:
             return y_t.flatten(), h_t, cache
         else:
             return y_t.flatten(), h_t
+
 
     def compute_loss(self, pred, target):
         if self.loss_fn == 'mae':
@@ -280,16 +290,17 @@ class NumPyLSTMFullBP:
         # Return gradients for all parameters.
         return grad_W, grad_b, dW_y, db_y
 
-    def train(self, X_train, y_train, epochs=50, batch_size=32):
+    def train(self, X_train, y_train, epochs=50, batch_size=32, initial_temperature=1.0, anneal_rate=0.99):
         print("\nTraining NumPy LSTM model with full backpropagation and mini-batch training...")
         n_samples = len(X_train)
+        temperature = initial_temperature  # Initialize temperature
+        
         for epoch in range(epochs):
             # Shuffle data at the start of each epoch.
             permutation = np.random.permutation(n_samples)
             X_shuffled = X_train[permutation]
             y_shuffled = y_train[permutation]
             total_loss = 0.0
-            # Initialize accumulators for gradients over mini-batch.
             batch_count = 0
             for i in range(0, n_samples, batch_size):
                 X_batch = X_shuffled[i:i + batch_size]
@@ -302,31 +313,26 @@ class NumPyLSTMFullBP:
                 accum_db_y = np.zeros_like(self.b['y'])
                 batch_loss = 0.0
 
-                # Process each sequence in the mini-batch.
                 for j in range(len(X_batch)):
                     x = X_batch[j]
                     y_true = y_batch[j].reshape(-1, 1)
-                    # Forward pass with caching.
-                    y_pred, h, cache = self.forward(x, cache_enabled=True)
+                    # Forward pass with temperature control in adaptive thresholding.
+                    y_pred, h, cache = self.forward(x, cache_enabled=True, temperature=temperature)
                     loss = self.compute_loss(y_pred, y_true)
                     batch_loss += loss
 
-                    # Backward pass for this sequence.
                     grad_W, grad_b, dW_y, db_y = self.backward(x, y_true, cache, y_pred)
 
-                    # Accumulate gradients.
                     for gate in ['f', 'i', 'c', 'o']:
                         accum_grad_W[gate] += grad_W[gate]
                         accum_grad_b[gate] += grad_b[gate]
                     accum_dW_y += dW_y
                     accum_db_y += db_y
 
-                # Average gradients over the mini-batch.
                 batch_size_actual = len(X_batch)
                 for gate in ['f', 'i', 'c', 'o']:
                     accum_grad_W[gate] /= batch_size_actual
                     accum_grad_b[gate] /= batch_size_actual
-                    # Apply gradient clipping.
                     accum_grad_W[gate] = self._clip_gradients(accum_grad_W[gate])
                     accum_grad_b[gate] = self._clip_gradients(accum_grad_b[gate])
                 accum_dW_y /= batch_size_actual
@@ -334,7 +340,6 @@ class NumPyLSTMFullBP:
                 accum_dW_y = self._clip_gradients(accum_dW_y)
                 accum_db_y = self._clip_gradients(accum_db_y)
 
-                # Update parameters for each gate.
                 for gate in ['f', 'i', 'c', 'o']:
                     self.W[gate] = self.optimizer.update(self.W[gate], accum_grad_W[gate], f'W_{gate}')
                     self.b[gate] = self.optimizer.update(self.b[gate], accum_grad_b[gate], f'b_{gate}')
@@ -347,13 +352,15 @@ class NumPyLSTMFullBP:
             avg_loss = total_loss / batch_count
             print(f"Epoch {epoch + 1}/{epochs}, Loss: {avg_loss:.6f}")
 
+            # Update temperature for simulated annealing.
+            temperature *= anneal_rate  # Simulated annealing: decay temperature
 
 # ---------------------- Train and Evaluate ---------------------- #
 # Initialize the model with a dropout rate of 0.2 (20% dropout)
-model = NumPyLSTMFullBP(input_dim=5, hidden_dim=64, output_dim=1, learning_rate=0.00005, loss_fn='rmse', clip_norm=5.0,dropout_rate=0.005)
+model = NumPyLSTMFullBP(input_dim=5, hidden_dim=200, output_dim=1, learning_rate=0.001, loss_fn='rmse', clip_norm=5.0,dropout_rate=0.001)
 
 # Train the model
-model.train(X_train, y_train, epochs=200, batch_size=32)
+model.train(X_train, y_train, epochs=150, batch_size=32)
 
 
 # Prediction (disable caching)
